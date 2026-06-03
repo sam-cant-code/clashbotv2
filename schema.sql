@@ -82,6 +82,11 @@ CREATE TABLE public.player_season_cache (
   player_tag character varying NOT NULL,
   league_season_id bigint NOT NULL,
   updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  league_group_tag character varying,
   CONSTRAINT player_season_cache_pkey PRIMARY KEY (player_tag),
   CONSTRAINT player_season_cache_player_tag_fkey FOREIGN KEY (player_tag) REFERENCES public.tracked_players(player_tag)
+);
+CREATE TABLE public.tracked_clans (
+  clan_tag character varying NOT NULL,
+  CONSTRAINT tracked_clans_pkey PRIMARY KEY (clan_tag)
 );
