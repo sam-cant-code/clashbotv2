@@ -28,10 +28,7 @@ LEADERBOARD_MESSAGE_ID = os.getenv("LEADERBOARD_MESSAGE_ID")
 TROPHY_EMOJI = "🏆"
 TH_EMOJIS = {
     16: "🏛️", 15: "🔺", 14: "🟩", 13: "🧊", 12: "⚡", 11: "🤍"
-} # Add custom Discord emojis here if you have them! e.g., "<:th16:123456>"
-LEAGUE_EMOJIS = {
-    "Legend League": "🛡️", "Titan League I": "💎", "Unranked": "➖"
-}
+} 
 
 def calc_legend_trophies(stars: int, dest: int) -> int:
     """Approximates standard Clash of Clans Legend League trophy gains."""
@@ -67,6 +64,7 @@ class CoCStatsBot(commands.Bot):
         })
         
         self.auto_refresh_leaderboard.start()
+        self.update_season_cache.start()
         self.poll_battlelogs.start()
 
     async def close(self):
@@ -76,9 +74,9 @@ class CoCStatsBot(commands.Bot):
             await self.db_pool.close()
         await super().close()
 
-    @tasks.loop(minutes=5)
-    async def poll_battlelogs(self):
-        """Polls the battlelog endpoint every 5 minutes and inserts new battles using a hash."""
+    @tasks.loop(hours=24)
+    async def update_season_cache(self):
+        """Polls player profiles once every 24 hours to keep their League Season ID fresh."""
         if not self.db_pool or not self.session:
             return
 
@@ -88,7 +86,7 @@ class CoCStatsBot(commands.Bot):
 
             for tag in tags:
                 encoded_tag = urllib.parse.quote(tag)
-                url = f"https://api.clashofclans.com/v1/players/{encoded_tag}/battlelog"
+                url = f"https://api.clashofclans.com/v1/players/{encoded_tag}"
                 
                 try:
                     async with self.session.get(url) as resp:
@@ -96,7 +94,76 @@ class CoCStatsBot(commands.Bot):
                             continue
                         
                         data = await resp.json()
-                        battles = data.get("items", [])
+                        season_id = data.get("currentLeagueSeasonId", 0)
+                        if season_id is None:
+                            season_id = 0
+                            
+                        updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+                        await conn.execute("""
+                            INSERT INTO player_season_cache (player_tag, league_season_id, updated_at)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (player_tag) DO UPDATE 
+                            SET league_season_id = EXCLUDED.league_season_id,
+                                updated_at = EXCLUDED.updated_at
+                        """, tag, season_id, updated_at)
+
+                except Exception as e:
+                    print(f"Error updating season cache for {tag}: {e}")
+
+    @update_season_cache.before_loop
+    async def before_update_season_cache(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(minutes=5)
+    async def poll_battlelogs(self):
+        """Polls the battlelog endpoint every 5 minutes and assigns the correct season ID."""
+        if not self.db_pool or not self.session:
+            return
+
+        async with self.db_pool.acquire() as conn:
+            records = await conn.fetch("SELECT player_tag FROM tracked_players")
+            tags = [r['player_tag'] for r in records]
+
+            for tag in tags:
+                encoded_tag = urllib.parse.quote(tag)
+                
+                # 1. Fetch the cached season ID
+                season_id = await conn.fetchval("SELECT league_season_id FROM player_season_cache WHERE player_tag = $1", tag)
+
+                if season_id is None:
+                    # Cache Miss! Fetch it right now so we don't insert NULL/0.
+                    profile_url = f"https://api.clashofclans.com/v1/players/{encoded_tag}"
+                    try:
+                        async with self.session.get(profile_url) as profile_resp:
+                            if profile_resp.status == 200:
+                                player_data = await profile_resp.json()
+                                season_id = player_data.get("currentLeagueSeasonId", 0)
+                                if season_id is None:
+                                    season_id = 0
+                                
+                                await conn.execute("""
+                                    INSERT INTO player_season_cache (player_tag, league_season_id)
+                                    VALUES ($1, $2)
+                                    ON CONFLICT (player_tag) DO UPDATE 
+                                    SET league_season_id = EXCLUDED.league_season_id,
+                                        updated_at = CURRENT_TIMESTAMP
+                                """, tag, season_id)
+                            else:
+                                season_id = 0
+                    except Exception as e:
+                        print(f"Error fetching profile cache for {tag}: {e}")
+                        season_id = 0
+
+                # 2. Fetch the Battle Log
+                battlelog_url = f"https://api.clashofclans.com/v1/players/{encoded_tag}/battlelog"
+                
+                try:
+                    async with self.session.get(battlelog_url) as battle_resp:
+                        if battle_resp.status != 200:
+                            continue
+                        battle_data = await battle_resp.json()
+                        battles = battle_data.get("items", [])
                         
                         for battle in battles:
                             if battle.get("battleType") != "ranked":
@@ -113,13 +180,16 @@ class CoCStatsBot(commands.Bot):
 
                             recorded_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
+                            # 3. Insert and Backfill NULLs from the ALTER TABLE statement
                             await conn.execute("""
                                 INSERT INTO ranked_battles (
                                     player_tag, recorded_at, is_attack, opponent_player_tag, 
-                                    stars, destruction_percentage, army_share_code, battle_hash
-                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                                ON CONFLICT (battle_hash) DO NOTHING
-                            """, tag, recorded_at, is_attack, opponent_tag, stars, destruction, army_share_code, battle_hash)
+                                    stars, destruction_percentage, army_share_code, battle_hash, league_season_id
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                ON CONFLICT (battle_hash) DO UPDATE 
+                                SET league_season_id = EXCLUDED.league_season_id 
+                                WHERE ranked_battles.league_season_id IS NULL
+                            """, tag, recorded_at, is_attack, opponent_tag, stars, destruction, army_share_code, battle_hash, season_id)
 
                 except Exception as e:
                     print(f"Error polling battlelog for {tag}: {e}")
@@ -294,31 +364,24 @@ async def battlelog(interaction: discord.Interaction, player_tag: str, is_legend
     await interaction.response.defer()
     target_tag = format_tag(player_tag).replace("#", "")
 
-    # Fetch fresh player data for Name, TH, Trophies, and League
     url = f"https://api.clashofclans.com/v1/players/%23{target_tag}"
     async with bot.session.get(url) as resp:
         if resp.status != 200:
             return await interaction.followup.send("❌ Could not find that player, or the API is currently unavailable.")
         d = await resp.json()
 
-    # THE FIX: Safely extract league name and current trophies using the correct API keys
-    l_name = d.get('leagueTier', {}).get('name', "Unranked")
+    league_tier = d.get('leagueTier', {})
+    l_id = league_tier.get('id')
+    l_name = league_tier.get('name', "Unranked")
     current_trophies = d.get('trophies', 0)
 
-    # Set Display Limits based on League
+    # Defaults in case the league isn't in the DB yet
     limit = 15
-    if "Skeleton" in l_name or "Barbarian" in l_name: limit = 6
-    elif "Archer" in l_name or "Wizard" in l_name: limit = 8
-    elif "Valkyrie" in l_name or "Witch" in l_name: limit = 10
-    elif "Golem" in l_name or "P.E.K.K.A" in l_name or "Titan" in l_name: limit = 12
-    elif "Dragon" in l_name: limit = 14
-    elif "Electro" in l_name: limit = 18
-    elif "Legend League 3" in l_name: limit = 24
-    elif "Legend League 2" in l_name: limit = 30
-    elif "Legend League 1" in l_name or is_legend_1: limit = 8
-    elif "Legend League" in l_name: limit = 8
+    lg_emoji = "➖"
 
-    # Calculate Time Boundaries
+    if is_legend_1:
+        limit = 8
+
     now_utc = datetime.now(timezone.utc)
     if is_legend_1 or "Legend League 1" in l_name:
         start_time = now_utc.replace(hour=5, minute=0, second=0, microsecond=0)
@@ -335,8 +398,17 @@ async def battlelog(interaction: discord.Interaction, player_tag: str, is_legend
     duration_str = f"{start_str} – {end_str}"
     query_start = start_time.replace(tzinfo=None)
 
-    # Fetch internal DB records
     async with bot.db_pool.acquire() as conn:
+        # Fetch league metadata directly from the database
+        if l_id:
+            league_record = await conn.fetchrow("SELECT emoji, attack_limit FROM leagues WHERE league_id = $1", l_id)
+            if league_record:
+                if league_record['emoji']: 
+                    lg_emoji = league_record['emoji']
+                if league_record['attack_limit'] and not is_legend_1:
+                    limit = league_record['attack_limit']
+
+        # Fetch the internal DB battle records
         records = await conn.fetch("""
             SELECT recorded_at, is_attack, opponent_player_tag, stars, destruction_percentage
             FROM ranked_battles
@@ -349,14 +421,10 @@ async def battlelog(interaction: discord.Interaction, player_tag: str, is_legend
             f"📉 No ranked battles found in the internal bot logs for **{d.get('name', 'Unknown')}** during this period ({duration_str})."
         )
 
-    # Convert asyncpg.Records to mutable dictionaries
     valid_logs = [dict(r) for r in records]
-
-    # Resolve Opponent Names efficiently (to match the name_cache functionality)
     opponent_tags = list(set(r['opponent_player_tag'] for r in valid_logs if r['opponent_player_tag'] != 'UNKNOWN'))
     name_cache = {}
     
-    # Optional: fetch missing names from API (safely handled to avoid rate limits)
     for o_tag in opponent_tags:
         if "UNKNOWN" in o_tag: continue
         o_url = f"https://api.clashofclans.com/v1/players/%23{o_tag.replace('#', '')}"
@@ -373,11 +441,9 @@ async def battlelog(interaction: discord.Interaction, player_tag: str, is_legend
     for log in valid_logs:
         log['opp_name'] = name_cache.get(log['opponent_player_tag'], 'Unknown')
 
-    # Split and Limit Logs
     offense_to_show = [b for b in valid_logs if b['is_attack']][:limit]
     defense_to_show = [b for b in valid_logs if not b['is_attack']][:limit]
 
-    # Averages & Totals Math
     def get_averages_and_totals(logs, is_off):
         if not logs: return 0.0, 0.0, 0
         total_stars = sum(b['stars'] for b in logs)
@@ -395,9 +461,7 @@ async def battlelog(interaction: discord.Interaction, player_tag: str, is_legend
 
     th_level = d.get('townHallLevel', 1)
     th_emoji = TH_EMOJIS.get(th_level, "🏘️")
-    lg_emoji = LEAGUE_EMOJIS.get(l_name, "➖")
 
-    # Build Base Embed
     embed = discord.Embed(
         title=f"{d.get('name', 'Unknown')} (#{target_tag})",
         url=f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={target_tag}",
@@ -410,7 +474,6 @@ async def battlelog(interaction: discord.Interaction, player_tag: str, is_legend
         f"🛡️ **Def:** {def_avg_stars:.2f} ★ | {def_avg_dest:.1f}%\n\u200b"
     )
 
-    # ANSI Text Formatter
     def build_column_text(logs, is_offense):
         if not logs:
             return "```ansi\n\u001b[0;36mNo logs yet.\u001b[0m\n```"
@@ -439,7 +502,6 @@ async def battlelog(interaction: discord.Interaction, player_tag: str, is_legend
             text += entry
         return f"```ansi\n{text}```"
 
-    # Attach UI Blocks to Embed
     embed.add_field(
         name=f"⚔️ Offense ({len(offense_to_show)}/{limit}) | +{total_off_trop} {TROPHY_EMOJI}", 
         value=build_column_text(offense_to_show, is_offense=True), 
