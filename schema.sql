@@ -66,9 +66,9 @@ CREATE TABLE public.war_attacks (
   destruction_percentage integer NOT NULL,
   duration_seconds integer,
   attack_order integer NOT NULL,
+  recorded_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT war_attacks_pkey PRIMARY KEY (attack_id),
-  CONSTRAINT war_attacks_war_id_fkey FOREIGN KEY (war_id) REFERENCES public.wars(war_id),
-  CONSTRAINT war_attacks_attacker_tag_fkey FOREIGN KEY (attacker_tag) REFERENCES public.tracked_players(player_tag)
+  CONSTRAINT war_attacks_war_id_fkey FOREIGN KEY (war_id) REFERENCES public.wars(war_id)
 );
 CREATE TABLE public.league_group_rankings (
   player_tag character varying NOT NULL,
@@ -83,10 +83,8 @@ CREATE TABLE public.player_season_cache (
   league_season_id bigint NOT NULL,
   updated_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   league_group_tag character varying,
+  player_name character varying,
+  clan_tag character varying,
   CONSTRAINT player_season_cache_pkey PRIMARY KEY (player_tag),
   CONSTRAINT player_season_cache_player_tag_fkey FOREIGN KEY (player_tag) REFERENCES public.tracked_players(player_tag)
-);
-CREATE TABLE public.tracked_clans (
-  clan_tag character varying NOT NULL,
-  CONSTRAINT tracked_clans_pkey PRIMARY KEY (clan_tag)
 );
